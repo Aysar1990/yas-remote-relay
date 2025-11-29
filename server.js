@@ -3,14 +3,9 @@ const http = require('http');
 
 const PORT = process.env.PORT || 3000;
 
-// Store connections
-const computers = new Map(); // id -> {ws, info, connectedClients}
-const clients = new Map();   // ws -> {computerId, deviceInfo}
-
-// Generate short code
-function generateCode() {
-    return 'YAS-' + Math.random().toString(36).substring(2, 6).toUpperCase();
-}
+// Store connections - now by password instead of code
+const computers = new Map(); // password -> {ws, info, connectedClients}
+const clients = new Map();   // ws -> {password, deviceInfo}
 
 // Create HTTP server
 const server = http.createServer((req, res) => {
@@ -23,18 +18,8 @@ const server = http.createServer((req, res) => {
             computers: computers.size,
             clients: clients.size
         }));
-    } else if (req.url === '/computers') {
-        const list = [];
-        computers.forEach((comp, id) => {
-            list.push({
-                code: id,
-                name: comp.info.name || 'Unknown',
-                clients: comp.connectedClients.size
-            });
-        });
-        res.end(JSON.stringify(list));
     } else {
-        res.end(JSON.stringify({ service: 'YAS Remote Relay', version: '1.0' }));
+        res.end(JSON.stringify({ service: 'YAS Remote Relay', version: '2.0' }));
     }
 });
 
@@ -68,56 +53,67 @@ wss.on('connection', (ws, req) => {
 function handleMessage(ws, msg) {
     switch (msg.type) {
         
-        // Computer registers itself
+        // Computer registers itself with password
         case 'register_computer':
-            const code = generateCode();
-            computers.set(code, {
-                ws: ws,
-                info: msg.info || {},
-                connectedClients: new Set(),
-                password: msg.password || ''
-            });
-            ws.computerId = code;
-            ws.isComputer = true;
+            const password = msg.password;
             
-            ws.send(JSON.stringify({
-                type: 'registered',
-                code: code
-            }));
-            
-            console.log(`Computer registered: ${code}`);
-            break;
-        
-        // Client connects to computer
-        case 'connect_to_computer':
-            const targetCode = msg.code;
-            const computer = computers.get(targetCode);
-            
-            if (!computer) {
+            if (!password) {
                 ws.send(JSON.stringify({
                     type: 'error',
-                    message: 'Computer not found'
+                    message: 'Password required'
                 }));
                 return;
             }
             
-            // Check password
-            if (computer.password && computer.password !== msg.password) {
+            // If another computer with same password exists, disconnect it
+            if (computers.has(password)) {
+                const oldComp = computers.get(password);
+                if (oldComp.ws && oldComp.ws.readyState === WebSocket.OPEN) {
+                    oldComp.ws.send(JSON.stringify({
+                        type: 'replaced',
+                        message: 'Another computer connected with same password'
+                    }));
+                    oldComp.ws.close();
+                }
+            }
+            
+            computers.set(password, {
+                ws: ws,
+                info: msg.info || {},
+                connectedClients: new Set()
+            });
+            ws.password = password;
+            ws.isComputer = true;
+            
+            ws.send(JSON.stringify({
+                type: 'registered',
+                message: 'Connected successfully'
+            }));
+            
+            console.log(`Computer registered with password`);
+            break;
+        
+        // Client connects using password only
+        case 'connect_to_computer':
+            const targetPassword = msg.password;
+            const computer = computers.get(targetPassword);
+            
+            if (!computer) {
                 ws.send(JSON.stringify({
                     type: 'error',
-                    message: 'Wrong password'
+                    message: 'Computer not found or offline'
                 }));
                 return;
             }
             
             // Register client
             clients.set(ws, {
-                computerId: targetCode,
+                password: targetPassword,
                 deviceInfo: msg.deviceInfo || {}
             });
             computer.connectedClients.add(ws);
             ws.isClient = true;
-            ws.targetComputer = targetCode;
+            ws.targetPassword = targetPassword;
             
             ws.send(JSON.stringify({
                 type: 'connected',
@@ -131,14 +127,13 @@ function handleMessage(ws, msg) {
                 totalClients: computer.connectedClients.size
             }));
             
-            console.log(`Client connected to ${targetCode}`);
+            console.log(`Client connected`);
             break;
         
         // Relay messages between computer and client
         case 'relay':
             if (ws.isComputer) {
-                // From computer to specific client or all clients
-                const comp = computers.get(ws.computerId);
+                const comp = computers.get(ws.password);
                 if (comp) {
                     comp.connectedClients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
@@ -147,8 +142,7 @@ function handleMessage(ws, msg) {
                     });
                 }
             } else if (ws.isClient) {
-                // From client to computer
-                const comp = computers.get(ws.targetComputer);
+                const comp = computers.get(ws.targetPassword);
                 if (comp && comp.ws.readyState === WebSocket.OPEN) {
                     comp.ws.send(JSON.stringify(msg.data));
                 }
@@ -158,7 +152,7 @@ function handleMessage(ws, msg) {
         // Get connected clients list
         case 'get_clients':
             if (ws.isComputer) {
-                const comp = computers.get(ws.computerId);
+                const comp = computers.get(ws.password);
                 if (comp) {
                     const clientList = [];
                     comp.connectedClients.forEach(c => {
@@ -181,43 +175,40 @@ function handleMessage(ws, msg) {
 }
 
 function handleDisconnect(ws) {
-    if (ws.isComputer && ws.computerId) {
-        const comp = computers.get(ws.computerId);
+    if (ws.isComputer && ws.password) {
+        const comp = computers.get(ws.password);
         if (comp) {
-            // Notify all clients
             comp.connectedClients.forEach(client => {
                 client.send(JSON.stringify({
                     type: 'computer_disconnected'
                 }));
             });
         }
-        computers.delete(ws.computerId);
-        console.log(`Computer disconnected: ${ws.computerId}`);
+        computers.delete(ws.password);
+        console.log(`Computer disconnected`);
     }
     
     if (ws.isClient) {
         const info = clients.get(ws);
         if (info) {
-            const comp = computers.get(info.computerId);
+            const comp = computers.get(info.password);
             if (comp) {
                 comp.connectedClients.delete(ws);
                 comp.ws.send(JSON.stringify({
                     type: 'client_disconnected',
-                    deviceInfo: info.deviceInfo,
                     totalClients: comp.connectedClients.size
                 }));
             }
         }
         clients.delete(ws);
-        console.log('Client disconnected');
+        console.log(`Client disconnected`);
     }
 }
 
 // Heartbeat to detect dead connections
-setInterval(() => {
+const interval = setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
-            handleDisconnect(ws);
             return ws.terminate();
         }
         ws.isAlive = false;
@@ -225,13 +216,10 @@ setInterval(() => {
     });
 }, 30000);
 
+wss.on('close', () => {
+    clearInterval(interval);
+});
+
 server.listen(PORT, () => {
-    console.log('');
-    console.log('========================================');
-    console.log('   YAS Remote Relay Server');
-    console.log('========================================');
-    console.log(`   Port: ${PORT}`);
-    console.log('   Status: Running');
-    console.log('========================================');
-    console.log('');
+    console.log(`YAS Remote Relay v2.0 running on port ${PORT}`);
 });
