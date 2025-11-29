@@ -96,17 +96,16 @@ function isLockedOut(ip) {
 /**
  * Record failed attempt
  */
-function recordFailedAttempt(ip) {
-    const attempts = failedAttempts.get(ip) || { count: 0, lastAttempt: 0 };
+function recordFailedAttempt(key) {
+    const attempts = failedAttempts.get(key) || { count: 0, lastAttempt: 0 };
     attempts.count++;
     attempts.lastAttempt = Date.now();
-    failedAttempts.set(ip, attempts);
+    failedAttempts.set(key, attempts);
     
-    logSecurityEvent('FAILED_LOGIN', { 
-        ip, 
+    logSecurityEvent(key, 'FAILED_LOGIN', { 
         attempts: attempts.count,
         lockedOut: attempts.count >= AUTH_CONFIG.maxFailedAttempts
-    }, ip);
+    });
     
     return attempts;
 }
@@ -119,33 +118,11 @@ function clearFailedAttempts(ip) {
 }
 
 /**
- * Validate password authentication
+ * Validate password format (simple validation)
  */
-function validatePassword(password, correctPassword, ip) {
-    if (isLockedOut(ip)) {
-        return {
-            success: false,
-            error: 'Too many failed attempts. Try again later.',
-            lockedOut: true
-        };
-    }
-    
-    if (password === correctPassword) {
-        clearFailedAttempts(ip);
-        logSecurityEvent('LOGIN_SUCCESS', { ip }, ip);
-        return { success: true };
-    }
-    
-    const attempts = recordFailedAttempt(ip);
-    const remaining = AUTH_CONFIG.maxFailedAttempts - attempts.count;
-    
-    return {
-        success: false,
-        error: remaining > 0 
-            ? `Invalid password. ${remaining} attempts remaining.`
-            : 'Account locked. Try again in 15 minutes.',
-        attemptsRemaining: Math.max(0, remaining)
-    };
+function validatePassword(password) {
+    // Just check if password exists and has minimum length
+    return password && password.length >= 4;
 }
 
 // ============================================
@@ -250,6 +227,28 @@ function getTrustedDevices(password) {
 // ============================================
 
 /**
+ * Check if locked out (alias for compatibility)
+ */
+function checkLockout(password) {
+    // Use password as key for lockout check
+    const attempts = failedAttempts.get(password);
+    if (!attempts) return { locked: false };
+    
+    if (attempts.count >= AUTH_CONFIG.maxFailedAttempts) {
+        const timeSinceLast = Date.now() - attempts.lastAttempt;
+        if (timeSinceLast < AUTH_CONFIG.lockoutDuration) {
+            const remainingMs = AUTH_CONFIG.lockoutDuration - timeSinceLast;
+            return { 
+                locked: true, 
+                remainingMinutes: Math.ceil(remainingMs / 60000)
+            };
+        }
+        failedAttempts.delete(password);
+    }
+    return { locked: false };
+}
+
+/**
  * Get security log
  */
 function getSecurityLog(limit = 20) {
@@ -282,6 +281,8 @@ module.exports = {
     // Auth functions
     validatePassword,
     isLockedOut,
+    checkLockout,
+    recordFailedAttempt,
     
     // Trusted devices
     registerTrustedDevice,
