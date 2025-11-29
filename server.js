@@ -6,12 +6,13 @@
 
 const WebSocket = require('ws');
 const http = require('http');
+const dgram = require('dgram');
 const auth = require('./auth');
 const sessions = require('./sessions');
 const fileHandler = require('./file-handler');
 
 const PORT = process.env.PORT || 3000;
-const VERSION = '3.2';
+const VERSION = '3.3';
 
 // ============================================
 // Data Stores
@@ -25,7 +26,15 @@ const clients = new Map();    // ws -> {sessionId, password, deviceInfo}
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Content-Type', 'application/json');
+    
+    // Handle CORS preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
     
     const url = req.url.split('?')[0];
     
@@ -34,7 +43,7 @@ const server = http.createServer((req, res) => {
             res.end(JSON.stringify({ 
                 service: 'YAS Remote Relay', 
                 version: VERSION,
-                features: ['auth', 'sessions', 'trusted-devices', 'security-log', 'file-transfer', 'multi-user', 'file-manager', 'file-watcher']
+                features: ['auth', 'sessions', 'trusted-devices', 'security-log', 'file-transfer', 'multi-user', 'file-manager', 'file-watcher', 'wake-on-lan']
             }));
             break;
             
@@ -46,6 +55,15 @@ const server = http.createServer((req, res) => {
                 clients: clients.size,
                 sessions: sessions.getSessionStats()
             }));
+            break;
+        
+        case '/wol':
+            if (req.method === 'POST') {
+                handleWakeOnLan(req, res);
+            } else {
+                res.statusCode = 405;
+                res.end(JSON.stringify({ error: 'Method not allowed' }));
+            }
             break;
             
         default:
@@ -908,6 +926,101 @@ function handleDisconnect(ws) {
 }
 
 // ============================================
+// Wake on LAN Handler
+// ============================================
+function handleWakeOnLan(req, res) {
+    let body = '';
+    
+    req.on('data', chunk => {
+        body += chunk.toString();
+    });
+    
+    req.on('end', () => {
+        try {
+            const data = JSON.parse(body);
+            const { mac, broadcastIp, port } = data;
+            
+            if (!mac) {
+                res.statusCode = 400;
+                res.end(JSON.stringify({ error: 'MAC address required' }));
+                return;
+            }
+            
+            // Create Magic Packet
+            const magicPacket = createMagicPacket(mac);
+            
+            // Send UDP packet
+            const client = dgram.createSocket('udp4');
+            
+            client.on('error', (err) => {
+                console.error('WoL UDP Error:', err);
+                client.close();
+            });
+            
+            client.bind(() => {
+                client.setBroadcast(true);
+                
+                const targetIp = broadcastIp || '255.255.255.255';
+                const targetPort = port || 9;
+                
+                client.send(magicPacket, 0, magicPacket.length, targetPort, targetIp, (err) => {
+                    client.close();
+                    
+                    if (err) {
+                        console.error('WoL Send Error:', err);
+                        res.statusCode = 500;
+                        res.end(JSON.stringify({ error: 'Failed to send wake packet', details: err.message }));
+                    } else {
+                        console.log(`✅ WoL packet sent to ${mac} via ${targetIp}:${targetPort}`);
+                        res.end(JSON.stringify({ 
+                            success: true, 
+                            message: 'Wake packet sent',
+                            mac: mac,
+                            target: `${targetIp}:${targetPort}`
+                        }));
+                    }
+                });
+            });
+            
+        } catch (e) {
+            console.error('WoL Parse Error:', e);
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'Invalid request body' }));
+        }
+    });
+}
+
+/**
+ * Create Magic Packet for Wake on LAN
+ * Format: 6 bytes of 0xFF followed by MAC address repeated 16 times
+ */
+function createMagicPacket(mac) {
+    // Parse MAC address
+    const macBytes = mac.split(/[-:]/).map(hex => parseInt(hex, 16));
+    
+    if (macBytes.length !== 6) {
+        throw new Error('Invalid MAC address format');
+    }
+    
+    // Create packet: 6 x 0xFF + 16 x MAC
+    const packet = Buffer.alloc(102);
+    
+    // First 6 bytes: 0xFF
+    for (let i = 0; i < 6; i++) {
+        packet[i] = 0xFF;
+    }
+    
+    // Repeat MAC 16 times
+    for (let i = 0; i < 16; i++) {
+        for (let j = 0; j < 6; j++) {
+            packet[6 + (i * 6) + j] = macBytes[j];
+        }
+    }
+    
+    return packet;
+}
+
+// ============================================
 // Start Server
 // ============================================
 server.listen(PORT, () => {
@@ -924,6 +1037,7 @@ server.listen(PORT, () => {
 ║  ✅ Multi-User: Ready                     ║
 ║  ✅ File Manager: Ready                   ║
 ║  ✅ File Watcher: Ready                   ║
+║  ✅ Wake on LAN: Ready                    ║
 ╚══════════════════════════════════════════╝
     `);
 });
