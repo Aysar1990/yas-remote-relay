@@ -110,6 +110,12 @@ setInterval(() => {
 // ============================================
 function handleMessage(ws, data) {
     switch (data.type) {
+        // ============ Ping ============
+        case 'ping':
+            // Respond to keep-alive ping
+            ws.send(JSON.stringify({ type: 'pong' }));
+            break;
+            
         // ============ Computer Registration ============
         case 'register_computer':
             handleRegisterComputer(ws, data);
